@@ -30,10 +30,12 @@ function source(url, type, index) {
 
 function renderedText(url) {
   const path = url.split("/").pop();
+  if (path === "blocked-evidence.md") return "";
   const fixtures = {
     "subject-profile.md": "Subject: official account. Trust context matches GenLayer public narrative.",
-    "primary-evidence.md": "Primary evidence: the subject post discusses online trust and machine-generated social activity.",
-    "social-trust-archive.md": "Archive: corroborates the social trust post and preserves observation context.",
+    "primary-evidence.md": "Primary evidence: the subject post discusses online trust and machine-generated social activity, and it gives validators enough readable source material to compare with the submitted claim.",
+    "social-trust-archive.md": "Archive: corroborates the social trust post and preserves observation context with enough stable text for validators to bind into the receipt.",
+    "README.md": "GenLayer project boilerplate documentation from an external organization. This independently corroborates the source bundle and gives validators a non-reporter-controlled reference point for the trust assessment.",
     "context-note.md": "Context: validators should fetch sources and return a durable verdict rather than a local keyword score.",
     "thin-context.md": "Context unavailable.",
   };
@@ -43,6 +45,7 @@ function renderedText(url) {
 function snapshots(sources) {
   return sources.map((item) => {
     const text = renderedText(item.canonical_url);
+    const fetchError = item.canonical_url.endsWith("/blocked-evidence.md");
     return {
       source_index: item.source_index,
       source_type: item.source_type,
@@ -51,6 +54,7 @@ function snapshots(sources) {
       url_hash: item.url_hash,
       snapshot_hash: sha256(text),
       snapshot_chars: text.length,
+      fetch_error: fetchError,
       text,
     };
   });
@@ -65,7 +69,32 @@ function commitments(sources, sourceSnapshots) {
     url_hash: item.url_hash,
     snapshot_hash: sourceSnapshots[index].snapshot_hash,
     snapshot_chars: sourceSnapshots[index].snapshot_chars,
+    fetch_error: sourceSnapshots[index].fetch_error,
   }));
+}
+
+function authorityReport(sources, sourceSnapshots) {
+  const subjectHost = sources[0].host;
+  const hosts = [...new Set(sources.map((item) => item.host))];
+  const readableExternalHosts = [];
+  const unreadableSources = [];
+  sources.forEach((item, index) => {
+    const snapshot = sourceSnapshots[index];
+    const readable = !snapshot.fetch_error && snapshot.snapshot_chars >= 80;
+    const evidenceSource = item.source_type === "primary_evidence" || item.source_type === "archive" || item.source_type === "context";
+    if (evidenceSource && !readable) unreadableSources.push(item.source_type);
+    if (evidenceSource && item.host !== subjectHost && readable) {
+      if (!readableExternalHosts.includes(item.host)) readableExternalHosts.push(item.host);
+    }
+  });
+  return {
+    subject_host: subjectHost,
+    distinct_hosts: hosts.length,
+    external_corroboration: readableExternalHosts.length >= 1,
+    readable_external_hosts: readableExternalHosts,
+    all_sources_readable: unreadableSources.length === 0,
+    unreadable_sources: unreadableSources,
+  };
 }
 
 class TrustLensModel {
@@ -75,11 +104,11 @@ class TrustLensModel {
     this.caseCount = 0;
   }
 
-  registerCase(contextUrl = "https://github.com/klopp78/trustlens-genlayer/blob/main/examples/context-note.md") {
-    const claim = "This public post is a trustworthy GenLayer social trust signal.";
+  registerCase(contextUrl = "https://github.com/genlayerlabs/genlayer-project-boilerplate/blob/main/README.md") {
+    const claim = "This GenLayer social trust signal should be trusted only when validator-fetched evidence is readable and independently corroborated.";
     const sources = [
-      source("https://x.com/GenLayer/status/2100198421806125549", "subject", 1),
-      source("https://x.com/GenLayer/status/2100198421806125549", "primary_evidence", 2),
+      source("https://github.com/klopp78/trustlens-genlayer/blob/main/examples/subject-profile.md", "subject", 1),
+      source("https://raw.githubusercontent.com/klopp78/trustlens-genlayer/main/examples/primary-evidence.md", "primary_evidence", 2),
       source("https://github.com/klopp78/trustlens-genlayer/blob/main/examples/social-trust-archive.md", "archive", 3),
       source(contextUrl, "context", 4),
     ];
@@ -122,18 +151,22 @@ class TrustLensModel {
     if (!record) throw new Error("case_not_found");
     const sourceSnapshots = snapshots(record.source_manifest);
     const snapshotCommitments = commitments(record.source_manifest, sourceSnapshots);
+    const authority = authorityReport(record.source_manifest, sourceSnapshots);
     const evidenceBundleHash = sha256(canonicalJson(snapshotCommitments));
-    const assessmentContextHash = sha256(canonicalJson({
+    const assessmentContext = {
       case_id: caseId,
       claim: record.claim,
       baseline_hash: record.baseline.baseline_hash,
       baseline_commitments: record.baseline.snapshot_commitments,
       current_snapshot_commitments: snapshotCommitments,
-    }));
-    const hosts = new Set(record.source_manifest.map((item) => item.host));
-    const evidenceDiverse = hosts.size >= 2;
-    const provenanceVerified = sourceSnapshots.every((item) => item.snapshot_chars > 20);
-    const decision = evidenceDiverse && provenanceVerified ? "trusted" : "needs_review";
+      authority_report: authority,
+    };
+    const assessmentContextHash = sha256(canonicalJson(assessmentContext));
+    const authorityReportHash = sha256(canonicalJson(authority));
+    const evidenceDiverse = authority.distinct_hosts >= 2 && authority.external_corroboration;
+    const sourceAuthorityVerified = evidenceDiverse && authority.all_sources_readable;
+    const provenanceVerified = sourceAuthorityVerified;
+    const decision = sourceAuthorityVerified ? "trusted" : "needs_review";
     const verdictId = `tlv_${sha256(`${caseId}|${decision}|${evidenceBundleHash}`).slice(0, 20)}`;
     if (this.verdicts.has(verdictId)) throw new Error("verdict_already_recorded");
     const verdict = {
@@ -150,7 +183,10 @@ class TrustLensModel {
         subject_match: true,
         evidence_diverse: evidenceDiverse,
         provenance_verified: provenanceVerified,
+        source_authority_verified: sourceAuthorityVerified,
         risk_level: decision === "trusted" ? "low" : "medium",
+        authority_report: authority,
+        authority_report_hash: authorityReportHash,
       },
       state: "finalized",
     };
@@ -178,10 +214,21 @@ const verdict = model.verdicts.get(verdictId);
 assert.equal(verdict.state, "finalized");
 assert.equal(verdict.consensus_result.decision, "trusted");
 assert.equal(verdict.consensus_result.evidence_diverse, true);
+assert.equal(verdict.consensus_result.source_authority_verified, true);
 assert.equal(verdict.evidence_bundle_hash.length, 64);
 assert.equal(verdict.assessment_context_hash.length, 64);
+assert.equal(verdict.consensus_result.authority_report_hash.length, 64);
 assert.deepEqual(model.cases.get(caseId).verdict_ids, [verdictId]);
 expectError(() => model.assessCase(caseId), "verdict_already_recorded");
 expectError(() => model.assessCase("trc_missing"), "case_not_found");
+
+const hostileModel = new TrustLensModel();
+const hostileCaseId = hostileModel.registerCase("https://github.com/klopp78/trustlens-genlayer/blob/main/examples/blocked-evidence.md");
+const hostileVerdictId = hostileModel.assessCase(hostileCaseId);
+const hostileVerdict = hostileModel.verdicts.get(hostileVerdictId);
+assert.equal(hostileVerdict.consensus_result.decision, "needs_review");
+assert.equal(hostileVerdict.consensus_result.provenance_verified, false);
+assert.equal(hostileVerdict.consensus_result.source_authority_verified, false);
+assert.deepEqual(hostileVerdict.consensus_result.authority_report.unreadable_sources, ["context"]);
 
 console.log("TrustLens lifecycle tests passed");

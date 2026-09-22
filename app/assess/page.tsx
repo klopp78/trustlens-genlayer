@@ -38,7 +38,7 @@ export default function AssessPage() {
         contractAddress: address as `0x${string}`,
       });
       setRecord(typeof result.verdict === "string" ? result.verdict : JSON.stringify(result.verdict, null, 2));
-      setMessage(`Verdict accepted: ${result.verdictId}`);
+      setMessage(`Verdict accepted: ${result.verdictId} (${result.finality})`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {

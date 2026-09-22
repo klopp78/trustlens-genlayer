@@ -1,10 +1,10 @@
 import { createClient } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
-import { TransactionStatus } from "genlayer-js/types";
+import { ExecutionResult, TransactionHashVariant, TransactionStatus } from "genlayer-js/types";
 
 export const TRUST_LENS_CONTRACT_ADDRESS =
   (process.env.NEXT_PUBLIC_TRUST_LENS_CONTRACT_ADDRESS ??
-    "0xA9ca3a672AFD28440E14D689581568c9Ed92e3BF") as `0x${string}`;
+    "0xAa856442052E97FA5C657e82850e86Efd69ADD50") as `0x${string}`;
 
 export type WalletAddress = `0x${string}`;
 
@@ -29,10 +29,13 @@ export type AssessInput = {
   contractAddress?: `0x${string}`;
 };
 
+export type WriteFinality = "finalized" | "accepted-readback";
+
 export function createTrustLensClient(walletAddress?: WalletAddress) {
   return createClient({
     chain: studionet,
     account: walletAddress,
+    provider: typeof window !== "undefined" ? window.ethereum : undefined,
   });
 }
 
@@ -40,26 +43,16 @@ function trustLensAddress(contractAddress?: `0x${string}`) {
   return contractAddress ?? TRUST_LENS_CONTRACT_ADDRESS;
 }
 
+function createReadClient() {
+  return createClient({ chain: studionet });
+}
+
 export async function readCase(caseId: string, options: ChainReadOptions = {}) {
-  const client = createTrustLensClient(options.walletAddress);
-  return client.readContract({
-    address: trustLensAddress(options.contractAddress),
-    functionName: "get_case",
-    args: [caseId],
-    jsonSafeReturn: true,
-    leaderOnly: true,
-  });
+  return readStoredRecord("get_case", [caseId], options);
 }
 
 export async function readVerdict(verdictId: string, options: ChainReadOptions = {}) {
-  const client = createTrustLensClient(options.walletAddress);
-  return client.readContract({
-    address: trustLensAddress(options.contractAddress),
-    functionName: "get_verdict",
-    args: [verdictId],
-    jsonSafeReturn: true,
-    leaderOnly: true,
-  });
+  return readStoredRecord("get_verdict", [verdictId], options);
 }
 
 export async function registerCase({
@@ -81,14 +74,10 @@ export async function registerCase({
     value: BigInt(0),
     leaderOnly: false,
   });
-  const receipt = await client.waitForTransactionReceipt({
-    hash,
-    status: TransactionStatus.ACCEPTED,
-    fullTransaction: true,
-  });
-  const caseId = idFromReceipt(receipt, /trc_[a-f0-9]{20}/, "case");
+  const { receipt, finality } = await waitForConsensusReceipt(client, hash, "case registration");
+  const caseId = returnedIdFromReceipt(receipt, "trc_", "case");
   const caseRecord = await readCase(caseId, { walletAddress, contractAddress: address });
-  return { hash, receipt, caseId, caseRecord };
+  return { hash, receipt, finality, caseId, caseRecord };
 }
 
 export async function assessCase({ walletAddress, caseId, contractAddress }: AssessInput) {
@@ -102,28 +91,107 @@ export async function assessCase({ walletAddress, caseId, contractAddress }: Ass
     value: BigInt(0),
     leaderOnly: false,
   });
-  const receipt = await client.waitForTransactionReceipt({
-    hash,
-    status: TransactionStatus.ACCEPTED,
-    fullTransaction: true,
-  });
-  const verdictId = idFromReceipt(receipt, /tlv_[a-f0-9]{20}/, "verdict");
+  const { receipt, finality } = await waitForConsensusReceipt(client, hash, "case assessment");
+  const verdictId = returnedIdFromReceipt(receipt, "tlv_", "verdict");
   const verdict = await readVerdict(verdictId, { walletAddress, contractAddress: address });
-  return { hash, receipt, verdictId, verdict };
+  return { hash, receipt, finality, verdictId, verdict };
 }
 
-function idFromReceipt(receipt: unknown, pattern: RegExp, label: string): string {
-  const id = collectStrings(receipt)
-    .map((value) => value.match(pattern)?.[0])
-    .find((value): value is string => Boolean(value));
-  if (!id) {
-    throw new Error(`Accepted ${label} transaction did not return its ID.`);
+async function waitForConsensusReceipt(
+  client: ReturnType<typeof createTrustLensClient>,
+  hash: `0x${string}`,
+  label: string,
+) {
+  try {
+    const receipt = await waitForReceipt(client, hash, TransactionStatus.FINALIZED, 140);
+    assertNoExecutionError(receipt, label);
+    return { receipt, finality: "finalized" as WriteFinality };
+  } catch (finalizedError) {
+    const receipt = await waitForReceipt(client, hash, TransactionStatus.ACCEPTED, 100);
+    assertNoExecutionError(receipt, label);
+    return { receipt, finality: "accepted-readback" as WriteFinality, finalizedError };
   }
-  return id;
 }
 
-function collectStrings(value: unknown): string[] {
-  if (typeof value === "string") return [value];
-  if (!value || typeof value !== "object") return [];
-  return Object.values(value as Record<string, unknown>).flatMap(collectStrings);
+async function waitForReceipt(
+  client: ReturnType<typeof createTrustLensClient>,
+  hash: `0x${string}`,
+  status: TransactionStatus,
+  retries: number,
+) {
+  return client.waitForTransactionReceipt({
+    hash,
+    status,
+    interval: 3000,
+    retries,
+    fullTransaction: true,
+  } as never);
+}
+
+function assertNoExecutionError(receipt: unknown, label: string) {
+  const resultName = (receipt as { txExecutionResultName?: string })?.txExecutionResultName;
+  if (resultName === ExecutionResult.FINISHED_WITH_ERROR) {
+    throw new Error(`${label} reached consensus but finished with a contract execution error.`);
+  }
+}
+
+async function readStoredRecord(functionName: string, args: string[], options: ChainReadOptions) {
+  const client = createReadClient();
+  const address = trustLensAddress(options.contractAddress);
+  const variants = [TransactionHashVariant.LATEST_FINAL, TransactionHashVariant.LATEST_NONFINAL] as const;
+  let lastError: unknown;
+  for (const transactionHashVariant of variants) {
+    try {
+      const result = await client.readContract({
+        address,
+        functionName,
+        args,
+        jsonSafeReturn: true,
+        transactionHashVariant,
+      });
+      const text = normalizeReadResult(result);
+      if (text.length === 0) throw new Error(`${functionName} returned an empty record.`);
+      return text;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`Unable to read ${functionName} from ${address}: ${errorMessage(lastError)}`);
+}
+
+function normalizeReadResult(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  return JSON.stringify(value);
+}
+
+export function returnedIdFromReceipt(receipt: unknown, prefix: "trc_" | "tlv_", label: string): string {
+  const direct = directReceiptReturn(receipt);
+  if (typeof direct === "string" && direct.startsWith(prefix) && direct.length === 24) {
+    return direct;
+  }
+  throw new Error(
+    `Accepted ${label} transaction did not expose a direct ${prefix} return field. Receipt keys: ${Object.keys(
+      (receipt as Record<string, unknown>) ?? {},
+    ).join(", ")}`,
+  );
+}
+
+function directReceiptReturn(receipt: unknown) {
+  if (!receipt || typeof receipt !== "object") return null;
+  const data = receipt as Record<string, unknown>;
+  for (const key of ["txExecutionResult", "executionResult", "returnValue", "result"]) {
+    const value = data[key];
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object") {
+      const nested = value as Record<string, unknown>;
+      if (typeof nested.value === "string") return nested.value;
+      if (typeof nested.returnValue === "string") return nested.returnValue;
+    }
+  }
+  return null;
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
 }

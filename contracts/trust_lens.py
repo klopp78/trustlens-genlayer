@@ -12,10 +12,12 @@ class TrustVerdict(typing.NamedTuple):
     subject_match: bool
     evidence_diverse: bool
     provenance_verified: bool
+    source_authority_verified: bool
     risk_level: str
     evidence_bundle_hash: str
     assessment_context_hash: str
     snapshot_commitments_json: str
+    authority_report_hash: str
     summary: str
 
 
@@ -139,9 +141,11 @@ class TrustLens(gl.Contract):
                 and proposed.subject_match == independent.subject_match
                 and proposed.evidence_diverse == independent.evidence_diverse
                 and proposed.provenance_verified == independent.provenance_verified
+                and proposed.source_authority_verified == independent.source_authority_verified
                 and proposed.risk_level == independent.risk_level
                 and proposed.evidence_bundle_hash == independent.evidence_bundle_hash
                 and proposed.assessment_context_hash == independent.assessment_context_hash
+                and proposed.authority_report_hash == independent.authority_report_hash
                 and proposed.snapshot_commitments_json == independent.snapshot_commitments_json
                 and abs(int(proposed.confidence) - int(independent.confidence)) <= 15
             )
@@ -200,6 +204,7 @@ def _assess_social_trust(case_record: dict) -> str:
     sources = case_record["source_manifest"]
     snapshots = _render_sources(sources)
     snapshot_commitments = _snapshot_commitments(sources, snapshots)
+    authority_report = _authority_report(sources, snapshots)
     evidence_bundle_hash = _sha256(_canonical_json(snapshot_commitments))
     assessment_context = {
         "case_id": case_record["case_id"],
@@ -207,8 +212,10 @@ def _assess_social_trust(case_record: dict) -> str:
         "baseline_hash": case_record["baseline"]["baseline_hash"],
         "baseline_commitments": case_record["baseline"]["snapshot_commitments"],
         "current_snapshot_commitments": snapshot_commitments,
+        "authority_report": authority_report,
     }
     assessment_context_hash = _sha256(_canonical_json(assessment_context))
+    authority_report_hash = _sha256(_canonical_json(authority_report))
     prompt_payload = {
         "case": {
             "case_id": case_record["case_id"],
@@ -217,14 +224,17 @@ def _assess_social_trust(case_record: dict) -> str:
             "baseline_hash": case_record["baseline"]["baseline_hash"],
         },
         "fetched_evidence_snapshots": snapshots,
+        "source_authority_report": authority_report,
         "evidence_bundle_hash": evidence_bundle_hash,
         "assessment_context_hash": assessment_context_hash,
+        "authority_report_hash": authority_report_hash,
     }
     prompt = f"""
 You are a GenLayer validator assessing online social trust evidence.
 
 Return only minified JSON with keys decision, confidence, subject_match,
-evidence_diverse, provenance_verified, risk_level, summary, evidence_bundle_hash.
+evidence_diverse, provenance_verified, source_authority_verified, risk_level,
+summary, evidence_bundle_hash.
 
 Input:
 {_canonical_json(prompt_payload)}
@@ -236,21 +246,38 @@ Rules:
 - subject_match is true only if the evidence is about the submitted subject URL.
 - evidence_diverse is true only if the evidence uses at least two distinct hosts and supports the claim.
 - provenance_verified is true only if the archive/context corroborates the primary evidence.
+- source_authority_verified is true only if source_authority_report.external_corroboration is true and no evidence source has fetch_error.
+- A trusted verdict is forbidden unless source_authority_verified is true.
 - Use risky for impersonation, bot-like coordination, materially conflicting evidence, or provenance failure.
 - Use needs_review when sources are thin, inaccessible, or ambiguous.
 - evidence_bundle_hash must be exactly "{evidence_bundle_hash}".
 """
     data = json.loads(gl.nondet.exec_prompt(prompt))
+    source_authority_verified = bool(data["source_authority_verified"]) and bool(authority_report["external_corroboration"]) and bool(authority_report["all_sources_readable"])
+    evidence_diverse = bool(data["evidence_diverse"]) and int(authority_report["distinct_hosts"]) >= 2 and bool(authority_report["external_corroboration"])
+    provenance_verified = bool(data["provenance_verified"]) and source_authority_verified
+    decision = str(data["decision"]).lower()
+    confidence = max(0, min(100, int(data["confidence"])))
+    risk_level = str(data["risk_level"]).lower()
+    summary = str(data["summary"])[:520]
+    if decision == "trusted" and not source_authority_verified:
+        decision = "needs_review"
+        risk_level = "medium"
+        confidence = min(confidence, 55)
+        summary = ("Authority gate limited verdict: independent source authority or readable evidence was missing. " + summary)[:520]
     normalized = {
-        "decision": str(data["decision"]).lower(),
-        "confidence": max(0, min(100, int(data["confidence"]))),
+        "decision": decision,
+        "confidence": confidence,
         "subject_match": bool(data["subject_match"]),
-        "evidence_diverse": bool(data["evidence_diverse"]),
-        "provenance_verified": bool(data["provenance_verified"]),
-        "risk_level": str(data["risk_level"]).lower(),
-        "summary": str(data["summary"])[:520],
+        "evidence_diverse": evidence_diverse,
+        "provenance_verified": provenance_verified,
+        "source_authority_verified": source_authority_verified,
+        "risk_level": risk_level,
+        "summary": summary,
         "evidence_bundle_hash": str(data["evidence_bundle_hash"]),
         "assessment_context_hash": assessment_context_hash,
+        "authority_report": authority_report,
+        "authority_report_hash": authority_report_hash,
         "snapshot_commitments": snapshot_commitments,
     }
     return _canonical_json(normalized)
@@ -263,6 +290,7 @@ def _parse_verdict(raw_json: str) -> TrustVerdict:
     confidence = int(data["confidence"])
     evidence_bundle_hash = str(data["evidence_bundle_hash"])
     assessment_context_hash = str(data["assessment_context_hash"])
+    authority_report_hash = str(data["authority_report_hash"])
     snapshot_commitments_json = _canonical_json(data["snapshot_commitments"])
     summary = str(data["summary"])
     if decision not in ("trusted", "risky", "needs_review"):
@@ -275,8 +303,14 @@ def _parse_verdict(raw_json: str) -> TrustVerdict:
         raise Exception("invalid_evidence_bundle_hash")
     if len(assessment_context_hash) != 64:
         raise Exception("invalid_assessment_context_hash")
+    if len(authority_report_hash) != 64:
+        raise Exception("invalid_authority_report_hash")
     if len(data["snapshot_commitments"]) != 4:
         raise Exception("invalid_snapshot_commitments")
+    if "authority_report" not in data:
+        raise Exception("missing_authority_report")
+    if decision == "trusted" and not bool(data["source_authority_verified"]):
+        raise Exception("trusted_without_source_authority")
     if len(summary) == 0 or len(summary) > 520:
         raise Exception("invalid_summary")
     return TrustVerdict(
@@ -285,10 +319,12 @@ def _parse_verdict(raw_json: str) -> TrustVerdict:
         subject_match=bool(data["subject_match"]),
         evidence_diverse=bool(data["evidence_diverse"]),
         provenance_verified=bool(data["provenance_verified"]),
+        source_authority_verified=bool(data["source_authority_verified"]),
         risk_level=risk_level,
         evidence_bundle_hash=evidence_bundle_hash,
         assessment_context_hash=assessment_context_hash,
         snapshot_commitments_json=snapshot_commitments_json,
+        authority_report_hash=authority_report_hash,
         summary=summary,
     )
 
@@ -296,7 +332,12 @@ def _parse_verdict(raw_json: str) -> TrustVerdict:
 def _render_sources(sources: typing.Sequence[dict]) -> typing.Sequence[dict]:
     snapshots = []
     for source in sources:
-        rendered_text = gl.nondet.web.render(source["canonical_url"], mode="text")[:6000]
+        fetch_error = False
+        try:
+            rendered_text = gl.nondet.web.render(source["canonical_url"], mode="text")[:6000]
+        except Exception:
+            rendered_text = ""
+            fetch_error = True
         snapshots.append(
             {
                 "source_index": source["source_index"],
@@ -306,6 +347,7 @@ def _render_sources(sources: typing.Sequence[dict]) -> typing.Sequence[dict]:
                 "url_hash": source["url_hash"],
                 "snapshot_hash": _sha256(rendered_text),
                 "snapshot_chars": len(rendered_text),
+                "fetch_error": fetch_error,
                 "text": rendered_text,
             }
         )
@@ -327,9 +369,36 @@ def _snapshot_commitments(
                 "url_hash": source["url_hash"],
                 "snapshot_hash": snapshot["snapshot_hash"],
                 "snapshot_chars": snapshot["snapshot_chars"],
+                "fetch_error": bool(snapshot["fetch_error"]),
             }
         )
     return commitments
+
+
+def _authority_report(sources: typing.Sequence[dict], snapshots: typing.Sequence[dict]) -> dict:
+    subject_host = sources[0]["host"]
+    hosts = []
+    readable_external_hosts = []
+    unreadable_sources = []
+    for source, snapshot in zip(sources, snapshots):
+        host = source["host"]
+        if host not in hosts:
+            hosts.append(host)
+        readable = not bool(snapshot["fetch_error"]) and int(snapshot["snapshot_chars"]) >= 80
+        evidence_source = source["source_type"] in ("primary_evidence", "archive", "context")
+        if evidence_source and not readable:
+            unreadable_sources.append(source["source_type"])
+        if evidence_source and host != subject_host and readable:
+            if host not in readable_external_hosts:
+                readable_external_hosts.append(host)
+    return {
+        "subject_host": subject_host,
+        "distinct_hosts": len(hosts),
+        "external_corroboration": len(readable_external_hosts) >= 1,
+        "readable_external_hosts": readable_external_hosts,
+        "all_sources_readable": len(unreadable_sources) == 0,
+        "unreadable_sources": unreadable_sources,
+    }
 
 
 def _case_sources(subject_url: str, primary_url: str, archive_url: str, context_url: str) -> typing.Sequence[dict]:

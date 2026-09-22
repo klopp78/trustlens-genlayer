@@ -11,11 +11,11 @@ declare global {
 }
 
 export default function CasePage() {
-  const [subjectUrl, setSubjectUrl] = useState("https://x.com/GenLayer/status/2100198421806125549");
-  const [claim, setClaim] = useState("This post argues that online trust now requires verifiable evidence because humans are a minority online.");
-  const [primaryEvidenceUrl, setPrimaryEvidenceUrl] = useState("https://x.com/GenLayer/status/2100198421806125549");
+  const [subjectUrl, setSubjectUrl] = useState("https://github.com/klopp78/trustlens-genlayer/blob/main/examples/subject-profile.md");
+  const [claim, setClaim] = useState("This GenLayer social trust signal should be trusted only when validator-fetched evidence is readable and independently corroborated.");
+  const [primaryEvidenceUrl, setPrimaryEvidenceUrl] = useState("https://raw.githubusercontent.com/klopp78/trustlens-genlayer/main/examples/primary-evidence.md");
   const [archiveUrl, setArchiveUrl] = useState("https://github.com/klopp78/trustlens-genlayer/blob/main/examples/social-trust-archive.md");
-  const [contextUrl, setContextUrl] = useState("https://github.com/klopp78/trustlens-genlayer/blob/main/examples/context-note.md");
+  const [contextUrl, setContextUrl] = useState("https://github.com/genlayerlabs/genlayer-project-boilerplate/blob/main/README.md");
   const [address, setAddress] = useState(TRUST_LENS_CONTRACT_ADDRESS);
   const [wallet, setWallet] = useState<WalletAddress | null>(null);
   const [message, setMessage] = useState("Connect a browser wallet to register a source-bound trust case.");
@@ -46,7 +46,7 @@ export default function CasePage() {
         contractAddress: address as `0x${string}`,
       });
       setRecord(typeof result.caseRecord === "string" ? result.caseRecord : JSON.stringify(result.caseRecord, null, 2));
-      setMessage(`Trust case accepted: ${result.caseId}`);
+      setMessage(`Trust case accepted: ${result.caseId} (${result.finality})`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {

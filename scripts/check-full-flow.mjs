@@ -9,17 +9,18 @@ class StudioFlowSimulator {
     this.calls = [];
     this.cases = new Map();
     this.verdicts = new Map();
+    this.receiptAttempts = new Map();
   }
 
   async writeContract({ functionName, args }) {
     this.calls.push({ kind: "write", functionName, args });
     if (functionName === "register_case") {
       const [subjectUrl, claim, primaryUrl, archiveUrl, contextUrl] = args;
-      assert.match(subjectUrl, /GenLayer\/status/);
-      assert.match(claim, /online trust/);
-      assert.match(primaryUrl, /GenLayer\/status/);
+      assert.match(subjectUrl, /subject-profile\.md$/);
+      assert.match(claim, /validator-fetched evidence/);
+      assert.match(primaryUrl, /primary-evidence\.md$/);
       assert.match(archiveUrl, /social-trust-archive\.md$/);
-      assert.match(contextUrl, /context-note\.md$/);
+      assert.match(contextUrl, /genlayer-project-boilerplate\/blob\/main\/README\.md$/);
       this.cases.set(caseId, {
         case_id: caseId,
         reporter: walletAddress.toLowerCase(),
@@ -52,7 +53,9 @@ class StudioFlowSimulator {
           subject_match: true,
           evidence_diverse: true,
           provenance_verified: true,
+          source_authority_verified: true,
           risk_level: "low",
+          authority_report_hash: "d".repeat(64),
         },
       });
       record.state = "assessed";
@@ -62,8 +65,13 @@ class StudioFlowSimulator {
     throw new Error(`Unexpected write ${functionName}`);
   }
 
-  async waitForTransactionReceipt({ hash }) {
-    this.calls.push({ kind: "receipt", hash });
+  async waitForTransactionReceipt({ hash, status }) {
+    this.calls.push({ kind: "receipt", hash, status });
+    const key = `${hash}:${status}`;
+    const attempts = (this.receiptAttempts.get(key) ?? 0) + 1;
+    this.receiptAttempts.set(key, attempts);
+    if (status === "FINALIZED") throw new Error("consensus rotation still finalizing");
+    if (hash === "0xregistercase" && attempts < 3) throw new Error("leader rotation in progress");
     if (hash === "0xregistercase") return { txExecutionResult: caseId };
     if (hash === "0xassesscase") return { txExecutionResult: verdictId };
     throw new Error(`Unknown transaction ${hash}`);
@@ -77,27 +85,56 @@ class StudioFlowSimulator {
   }
 }
 
-function receiptString(receipt, pattern, label) {
-  const value = Object.values(receipt).find(
-    (candidate) => typeof candidate === "string" && pattern.test(candidate),
+function directReceiptReturn(receipt) {
+  for (const key of ["txExecutionResult", "executionResult", "returnValue", "result"]) {
+    const value = receipt[key];
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object") {
+      if (typeof value.value === "string") return value.value;
+      if (typeof value.returnValue === "string") return value.returnValue;
+    }
+  }
+  return null;
+}
+
+function returnedIdFromReceipt(receipt, prefix, label) {
+  const value = directReceiptReturn(receipt);
+  assert.ok(
+    typeof value === "string" && value.startsWith(prefix) && value.length === 24,
+    `Accepted ${label} receipt must expose a direct ${prefix} return field`,
   );
-  assert.ok(value, `Accepted ${label} receipt must contain its returned identifier`);
   return value;
+}
+
+async function waitForConsensusReceipt(client, hash) {
+  try {
+    return await client.waitForTransactionReceipt({ hash, status: "FINALIZED" });
+  } catch {
+    let lastError;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        return await client.waitForTransactionReceipt({ hash, status: "ACCEPTED" });
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
 }
 
 async function runFullFlow(client) {
   const caseHash = await client.writeContract({
     functionName: "register_case",
     args: [
-      "https://x.com/GenLayer/status/2100198421806125549",
-      "This post argues that online trust now requires verifiable evidence because humans are a minority online.",
-      "https://x.com/GenLayer/status/2100198421806125549",
+      "https://github.com/klopp78/trustlens-genlayer/blob/main/examples/subject-profile.md",
+      "This GenLayer social trust signal should be trusted only when validator-fetched evidence is readable and independently corroborated.",
+      "https://raw.githubusercontent.com/klopp78/trustlens-genlayer/main/examples/primary-evidence.md",
       "https://github.com/klopp78/trustlens-genlayer/blob/main/examples/social-trust-archive.md",
-      "https://github.com/klopp78/trustlens-genlayer/blob/main/examples/context-note.md",
+      "https://github.com/genlayerlabs/genlayer-project-boilerplate/blob/main/README.md",
     ],
   });
-  const caseReceipt = await client.waitForTransactionReceipt({ hash: caseHash });
-  const returnedCaseId = receiptString(caseReceipt, /^trc_[a-f0-9]{20}$/, "case");
+  const caseReceipt = await waitForConsensusReceipt(client, caseHash);
+  const returnedCaseId = returnedIdFromReceipt(caseReceipt, "trc_", "case");
   const caseRecord = JSON.parse(await client.readContract({
     functionName: "get_case",
     args: [returnedCaseId],
@@ -109,8 +146,8 @@ async function runFullFlow(client) {
     functionName: "assess_case",
     args: [returnedCaseId],
   });
-  const verdictReceipt = await client.waitForTransactionReceipt({ hash: verdictHash });
-  const returnedVerdictId = receiptString(verdictReceipt, /^tlv_[a-f0-9]{20}$/, "verdict");
+  const verdictReceipt = await waitForConsensusReceipt(client, verdictHash);
+  const returnedVerdictId = returnedIdFromReceipt(verdictReceipt, "tlv_", "verdict");
   const verdict = JSON.parse(await client.readContract({
     functionName: "get_verdict",
     args: [returnedVerdictId],
@@ -118,6 +155,7 @@ async function runFullFlow(client) {
   assert.equal(verdict.state, "finalized");
   assert.equal(verdict.consensus_result.decision, "trusted");
   assert.equal(verdict.consensus_result.provenance_verified, true);
+  assert.equal(verdict.consensus_result.source_authority_verified, true);
   assert.equal(verdict.evidence_bundle_hash.length, 64);
   return { returnedCaseId, returnedVerdictId };
 }
@@ -129,8 +167,12 @@ assert.deepEqual(
   [
     "write:register_case",
     "receipt:0xregistercase",
+    "receipt:0xregistercase",
+    "receipt:0xregistercase",
+    "receipt:0xregistercase",
     "read:get_case",
     "write:assess_case",
+    "receipt:0xassesscase",
     "receipt:0xassesscase",
     "read:get_verdict",
   ],
